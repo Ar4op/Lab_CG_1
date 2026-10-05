@@ -1,0 +1,11 @@
+# Build
+build-*/
+
+# IDE
+.vs/
+
+# ImGUI личные настройки окна
+imgui.ini
+
+# Logs
+*.log
