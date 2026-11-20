@@ -7,7 +7,11 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -27,7 +31,7 @@ namespace {
 struct Vertex {
     glm::vec3 pos;
     glm::vec3 normal;
-    glm::vec3 color;
+    glm::vec2 uv;
 };
 
 struct SceneUniforms {
@@ -42,9 +46,20 @@ struct SceneUniforms {
 struct ModelUniforms {
     glm::mat4 model;
     glm::mat4 normalMatrix;
-    glm::vec4 albedo;
     glm::vec4 specular;
 };
+
+struct SamplingPushConstants {
+    glm::vec4 tintA;
+    glm::vec4 tintB;
+    float     time;
+    float     distortion;
+    float     layerScale;
+    uint32_t  flags;
+};
+
+constexpr uint32_t FLAG_ANIMATED_SAMPLING = 1u;
+constexpr uint32_t FLAG_COLOR_MODULATION  = 2u;
 
 struct GpuPointLight {
     glm::vec4 position;
@@ -70,22 +85,28 @@ struct Mesh {
     uint32_t indexCount = 0;
 };
 
+struct Texture {
+    std::string     name;
+    VkImage         image         = VK_NULL_HANDLE;
+    VmaAllocation   allocation    = VK_NULL_HANDLE;
+    VkImageView     view          = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+};
+
 struct Material {
-    glm::vec3 albedo         = glm::vec3(1.0f);
-    float     vertexColorMix = 0.0f;
-    glm::vec3 specular       = glm::vec3(1.0f);
-    float     shininess      = 32.0f;
+    int       texture   = 0;
+    glm::vec3 specular  = glm::vec3(0.5f);
+    float     shininess = 32.0f;
 };
 
 struct SceneObject {
-    std::string     name;
-    Mesh*           mesh = nullptr;
-    glm::vec3       position = glm::vec3(0.0f);
-    glm::vec3       rotation = glm::vec3(0.0f);
-    glm::vec3       scale    = glm::vec3(1.0f);
-    Material        material;
-    Buffer          uniforms;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    std::string name;
+    Mesh*       mesh     = nullptr;
+    glm::vec3   position = glm::vec3(0.0f);
+    glm::vec3   rotation = glm::vec3(0.0f);
+    glm::vec3   scale    = glm::vec3(1.0f);
+    Material    material;
+    bool        animatedSampling = false;
 };
 
 struct Camera {
@@ -106,9 +127,9 @@ struct Camera {
 };
 
 struct DirectionalLight {
-    glm::vec3 direction = glm::vec3(-0.4f, -1.0f, -0.3f);
+    glm::vec3 direction = glm::vec3(-0.4f, -1.0f, -0.6f);
     glm::vec3 color     = glm::vec3(1.0f, 0.95f, 0.85f);
-    float     intensity = 0.25f;
+    float     intensity = 0.35f;
 };
 
 struct PointLight {
@@ -130,26 +151,33 @@ struct SpotLight {
 // ---------------------------------------------------------------------------
 // Состояние
 // ---------------------------------------------------------------------------
-VkPipeline            pipeline              = VK_NULL_HANDLE;
-VkPipelineLayout      pipelineLayout        = VK_NULL_HANDLE;
-VkDescriptorSetLayout sceneSetLayout        = VK_NULL_HANDLE;
-VkDescriptorSetLayout modelSetLayout        = VK_NULL_HANDLE;
-VkDescriptorPool      descriptorPool        = VK_NULL_HANDLE;
-VkDescriptorSet       sceneSet              = VK_NULL_HANDLE;
+VkPipeline            pipeline          = VK_NULL_HANDLE;
+VkPipelineLayout      pipelineLayout    = VK_NULL_HANDLE;
+VkDescriptorSetLayout sceneSetLayout    = VK_NULL_HANDLE;
+VkDescriptorSetLayout materialSetLayout = VK_NULL_HANDLE;
+VkDescriptorPool      descriptorPool    = VK_NULL_HANDLE;
+VkDescriptorSet       sceneSet          = VK_NULL_HANDLE;
+VkCommandPool         uploadPool        = VK_NULL_HANDLE;
+VkSampler             sampler           = VK_NULL_HANDLE;
 
-Buffer sceneUniformBuffer;
-Buffer pointLightBuffer;
-Buffer spotLightBuffer;
+Buffer       sceneUniformBuffer;
+Buffer       pointLightBuffer;
+Buffer       spotLightBuffer;
+Buffer       modelUniformBuffer;
+VkDeviceSize modelUniformStride = 0;
+
+std::vector<Texture> textures;
 
 Mesh dodecahedronMesh;
 Mesh floorMesh;
+Mesh wallMesh;
 
 std::vector<SceneObject> objects;
 
 Camera                  camera;
 DirectionalLight        dirLight;
 glm::vec3               ambientColor     = glm::vec3(0.6f, 0.7f, 1.0f);
-float                   ambientIntensity = 0.08f;
+float                   ambientIntensity = 0.12f;
 std::vector<PointLight> pointLights;
 std::vector<SpotLight>  spotLights;
 
@@ -159,8 +187,18 @@ float pathRadius     = 2.0f;
 float animationTime  = 0.0f;
 bool  animateLights  = false;
 
-constexpr size_t initialLightCapacity = 4;
-constexpr float  floorHeight          = -2.5f;
+float     effectSpeed      = 1.0f;
+float     effectTime       = 0.0f;
+float     effectDistortion = 0.03f;
+float     effectLayerScale = 1.6f;
+bool      colorModulation  = true;
+glm::vec3 tintA            = glm::vec3(1.0f, 0.55f, 0.25f);
+glm::vec3 tintB            = glm::vec3(0.35f, 0.6f, 1.0f);
+
+constexpr size_t   initialLightCapacity = 4;
+constexpr float    floorHeight          = -2.5f;
+constexpr float    dodecahedronBottom   = 1.61803f;
+constexpr VkFormat textureFormat        = VK_FORMAT_R8G8B8A8_SRGB;
 
 VkDevice device() { return graphics::internal::context.device; }
 VmaAllocator allocator() { return graphics::internal::context.allocator; }
@@ -170,10 +208,66 @@ glm::vec3 safeNormalize(const glm::vec3& v, const glm::vec3& fallback) {
     return len > 1e-4f ? v / len : fallback;
 }
 
+std::filesystem::path findDataPath(const std::string& relative) {
+    static const char* searchDirs[] = { "", "../", "../../", "../../../" };
+    for (const char* dir : searchDirs) {
+        const std::filesystem::path candidate = std::filesystem::path(dir) / relative;
+        if (std::filesystem::exists(candidate)) return candidate;
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// Команды копирования (однократная отправка)
+// ---------------------------------------------------------------------------
+bool createUploadPool() {
+    const VkCommandPoolCreateInfo poolInfo = {
+        .sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = graphics::internal::context.graphics_queue_index,
+    };
+    return vkCreateCommandPool(device(), &poolInfo, nullptr, &uploadPool) == VK_SUCCESS;
+}
+
+template <typename Record>
+bool immediateSubmit(Record&& record) {
+    const VkCommandBufferAllocateInfo allocInfo = {
+        .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool        = uploadPool,
+        .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device(), &allocInfo, &cmd) != VK_SUCCESS) return false;
+
+    const VkCommandBufferBeginInfo beginInfo = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+
+    vkBeginCommandBuffer(cmd, &beginInfo);
+    record(cmd);
+    vkEndCommandBuffer(cmd);
+
+    const VkSubmitInfo submit = {
+        .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers    = &cmd,
+    };
+
+    const VkQueue queue = graphics::internal::context.graphics_queue;
+    VkResult result = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    if (result == VK_SUCCESS) result = vkQueueWaitIdle(queue);
+
+    vkFreeCommandBuffers(device(), uploadPool, 1, &cmd);
+    return result == VK_SUCCESS;
+}
+
 // ---------------------------------------------------------------------------
 // Буферы
 // ---------------------------------------------------------------------------
-bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& out) {
+bool createHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& out) {
     const VkBufferCreateInfo bufferInfo = {
         .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size        = size,
@@ -190,12 +284,34 @@ bool createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& out) {
     VmaAllocationInfo info;
     if (vmaCreateBuffer(allocator(), &bufferInfo, &allocInfo,
                         &out.buffer, &out.allocation, &info) != VK_SUCCESS) {
-        std::cerr << "Failed to create buffer\n";
+        std::cerr << "Failed to create host buffer\n";
         return false;
     }
 
     out.mapped = info.pMappedData;
     out.size   = size;
+    return true;
+}
+
+bool createDeviceBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& out) {
+    const VkBufferCreateInfo bufferInfo = {
+        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size        = size,
+        .usage       = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+
+    const VmaAllocationCreateInfo allocInfo = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+
+    if (vmaCreateBuffer(allocator(), &bufferInfo, &allocInfo,
+                        &out.buffer, &out.allocation, nullptr) != VK_SUCCESS) {
+        std::cerr << "Failed to create device buffer\n";
+        return false;
+    }
+
+    out.size = size;
     return true;
 }
 
@@ -212,26 +328,45 @@ void uploadBuffer(Buffer& buffer, const void* data, VkDeviceSize size) {
     vmaFlushAllocation(allocator(), buffer.allocation, 0, size);
 }
 
+bool createStagingBuffer(const void* data, VkDeviceSize size, Buffer& staging) {
+    if (!createHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, staging)) return false;
+    uploadBuffer(staging, data, size);
+    return true;
+}
+
+bool uploadToDevice(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, Buffer& out) {
+    Buffer staging;
+    if (!createStagingBuffer(data, size, staging)) return false;
+
+    bool ok = createDeviceBuffer(size, usage, out);
+    if (ok) {
+        ok = immediateSubmit([&](VkCommandBuffer cmd) {
+            const VkBufferCopy region = { .srcOffset = 0, .dstOffset = 0, .size = size };
+            vkCmdCopyBuffer(cmd, staging.buffer, out.buffer, 1, &region);
+        });
+    }
+
+    destroyBuffer(staging);
+    return ok;
+}
+
 bool ensureCapacity(Buffer& buffer, VkDeviceSize required) {
     if (required <= buffer.size) return false;
 
     const VkDeviceSize newSize = std::max(buffer.size * 2, required);
     destroyBuffer(buffer);
-    createBuffer(newSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, buffer);
+    createHostBuffer(newSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, buffer);
     return true;
 }
 
 bool createMesh(const std::vector<Vertex>& vertices, const std::vector<uint16_t>& indices, Mesh& mesh) {
-    const VkDeviceSize vSize = sizeof(Vertex) * vertices.size();
-    const VkDeviceSize iSize = sizeof(uint16_t) * indices.size();
-
-    if (!createBuffer(vSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, mesh.vertices) ||
-        !createBuffer(iSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, mesh.indices)) {
+    if (!uploadToDevice(vertices.data(), sizeof(Vertex) * vertices.size(),
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, mesh.vertices) ||
+        !uploadToDevice(indices.data(), sizeof(uint16_t) * indices.size(),
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, mesh.indices)) {
         return false;
     }
 
-    uploadBuffer(mesh.vertices, vertices.data(), vSize);
-    uploadBuffer(mesh.indices, indices.data(), iSize);
     mesh.indexCount = static_cast<uint32_t>(indices.size());
     return true;
 }
@@ -243,10 +378,224 @@ void destroyMesh(Mesh& mesh) {
 }
 
 // ---------------------------------------------------------------------------
-// Геометрия: додекаэдр (плоские нормали)
+// Текстуры
 // ---------------------------------------------------------------------------
-constexpr float PHI = 1.61803398875f;
+void imageBarrier(VkCommandBuffer cmd, VkImage image, uint32_t baseMip, uint32_t mipCount,
+                  VkImageLayout oldLayout, VkImageLayout newLayout,
+                  VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                  VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage) {
+    const VkImageMemoryBarrier barrier = {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask       = srcAccess,
+        .dstAccessMask       = dstAccess,
+        .oldLayout           = oldLayout,
+        .newLayout           = newLayout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = image,
+        .subresourceRange    = {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = baseMip,
+            .levelCount     = mipCount,
+            .baseArrayLayer = 0,
+            .layerCount     = 1,
+        },
+    };
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
 
+bool supportsMipmapBlit() {
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(graphics::internal::context.physical_device, textureFormat, &props);
+
+    const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    return (props.optimalTilingFeatures & required) == required;
+}
+
+bool createTexture(const std::string& name, const uint8_t* pixels, uint32_t width, uint32_t height, Texture& out) {
+    const VkDeviceSize size = VkDeviceSize(width) * height * 4;
+    const uint32_t mipLevels = supportsMipmapBlit()
+        ? static_cast<uint32_t>(std::floor(std::log2(std::max(width, height)))) + 1
+        : 1;
+
+    Buffer staging;
+    if (!createStagingBuffer(pixels, size, staging)) return false;
+
+    const VkImageCreateInfo imageInfo = {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType     = VK_IMAGE_TYPE_2D,
+        .format        = textureFormat,
+        .extent        = { width, height, 1 },
+        .mipLevels     = mipLevels,
+        .arrayLayers   = 1,
+        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .tiling        = VK_IMAGE_TILING_OPTIMAL,
+        .usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    const VmaAllocationCreateInfo allocInfo = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+
+    if (vmaCreateImage(allocator(), &imageInfo, &allocInfo, &out.image, &out.allocation, nullptr) != VK_SUCCESS) {
+        std::cerr << "Failed to create texture image: " << name << "\n";
+        destroyBuffer(staging);
+        return false;
+    }
+
+    const bool uploaded = immediateSubmit([&](VkCommandBuffer cmd) {
+        imageBarrier(cmd, out.image, 0, mipLevels,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        const VkBufferImageCopy copy = {
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .imageExtent      = { width, height, 1 },
+        };
+        vkCmdCopyBufferToImage(cmd, staging.buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+        int32_t mipWidth  = static_cast<int32_t>(width);
+        int32_t mipHeight = static_cast<int32_t>(height);
+
+        for (uint32_t i = 1; i < mipLevels; ++i) {
+            imageBarrier(cmd, out.image, i - 1, 1,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+            const int32_t nextWidth  = std::max(mipWidth / 2, 1);
+            const int32_t nextHeight = std::max(mipHeight / 2, 1);
+
+            const VkImageBlit blit = {
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1 },
+                .srcOffsets     = { { 0, 0, 0 }, { mipWidth, mipHeight, 1 } },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1 },
+                .dstOffsets     = { { 0, 0, 0 }, { nextWidth, nextHeight, 1 } },
+            };
+            vkCmdBlitImage(cmd, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+            imageBarrier(cmd, out.image, i - 1, 1,
+                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+            mipWidth  = nextWidth;
+            mipHeight = nextHeight;
+        }
+
+        imageBarrier(cmd, out.image, mipLevels - 1, 1,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    });
+
+    destroyBuffer(staging);
+    if (!uploaded) return false;
+
+    const VkImageViewCreateInfo viewInfo = {
+        .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image            = out.image,
+        .viewType         = VK_IMAGE_VIEW_TYPE_2D,
+        .format           = textureFormat,
+        .subresourceRange = {
+            .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel   = 0,
+            .levelCount     = mipLevels,
+            .baseArrayLayer = 0,
+            .layerCount     = 1,
+        },
+    };
+
+    if (vkCreateImageView(device(), &viewInfo, nullptr, &out.view) != VK_SUCCESS) {
+        std::cerr << "Failed to create texture view: " << name << "\n";
+        return false;
+    }
+
+    out.name = name;
+    return true;
+}
+
+void destroyTexture(Texture& texture) {
+    vkDestroyImageView(device(), texture.view, nullptr);
+    if (texture.image != VK_NULL_HANDLE) {
+        vmaDestroyImage(allocator(), texture.image, texture.allocation);
+    }
+    texture = {};
+}
+
+bool loadTextures() {
+    std::vector<std::filesystem::path> files;
+
+    const std::filesystem::path dir = findDataPath("textures");
+    if (!dir.empty()) {
+        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".tga") {
+                files.push_back(entry.path());
+            }
+        }
+        std::sort(files.begin(), files.end());
+    }
+
+    for (const auto& file : files) {
+        int width = 0, height = 0, channels = 0;
+        stbi_uc* pixels = stbi_load(file.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
+        if (pixels == nullptr) {
+            std::cerr << "Failed to load " << file.string() << ": " << stbi_failure_reason() << "\n";
+            continue;
+        }
+
+        Texture texture;
+        const bool ok = createTexture(file.filename().string(), pixels, width, height, texture);
+        stbi_image_free(pixels);
+
+        if (!ok) return false;
+        textures.push_back(texture);
+    }
+
+    if (textures.empty()) {
+        std::cerr << "No textures found in 'textures' folder, using white fallback\n";
+        const uint8_t white[4] = { 255, 255, 255, 255 };
+        Texture texture;
+        if (!createTexture("white (fallback)", white, 1, 1, texture)) return false;
+        textures.push_back(texture);
+    }
+
+    return true;
+}
+
+int findTexture(const std::string& stem) {
+    for (size_t i = 0; i < textures.size(); ++i) {
+        if (std::filesystem::path(textures[i].name).stem() == stem) return static_cast<int>(i);
+    }
+    return 0;
+}
+
+bool createSampler() {
+    const VkSamplerCreateInfo samplerInfo = {
+        .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter    = VK_FILTER_LINEAR,
+        .minFilter    = VK_FILTER_LINEAR,
+        .mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .maxLod       = VK_LOD_CLAMP_NONE,
+        .borderColor  = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+    };
+    return vkCreateSampler(device(), &samplerInfo, nullptr, &sampler) == VK_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// Геометрия: додекаэдр (плоские нормали, UV на каждую грань)
+// ---------------------------------------------------------------------------
 void buildDodecahedron(std::vector<Vertex>& vertices, std::vector<uint16_t>& indices) {
     static const glm::vec3 positions[] = {
         {-1.0f,       1.0f,      -1.0f},      {-1.61803f,   0.0f,       0.618034f},
@@ -270,8 +619,12 @@ void buildDodecahedron(std::vector<Vertex>& vertices, std::vector<uint16_t>& ind
         13, 19, 12, 19, 13, 14, 19, 14, 15, 19, 17, 18, 17, 19, 16, 16, 19, 15,
     };
 
-    vertices.clear();
-    indices.clear();
+    struct Face {
+        glm::vec3                             normal;
+        std::vector<glm::vec3>                corners;
+        std::vector<std::array<glm::vec3, 3>> triangles;
+    };
+    std::vector<Face> faces;
 
     for (size_t t = 0; t < std::size(tris); t += 3) {
         glm::vec3 a = positions[tris[t + 0]];
@@ -284,64 +637,80 @@ void buildDodecahedron(std::vector<Vertex>& vertices, std::vector<uint16_t>& ind
             n = -n;
         }
 
+        auto face = std::find_if(faces.begin(), faces.end(),
+                                 [&](const Face& f) { return glm::dot(f.normal, n) > 0.999f; });
+        if (face == faces.end()) {
+            faces.push_back({ n, {}, {} });
+            face = faces.end() - 1;
+        }
+
+        face->triangles.push_back({ a, b, c });
         for (const glm::vec3& p : { a, b, c }) {
-            const glm::vec3 color = glm::vec3(0.5f) + 0.5f * p / PHI;
-            indices.push_back(static_cast<uint16_t>(vertices.size()));
-            vertices.push_back({ p, n, color });
+            const bool known = std::any_of(face->corners.begin(), face->corners.end(),
+                                           [&](const glm::vec3& q) { return glm::length(p - q) < 1e-4f; });
+            if (!known) face->corners.push_back(p);
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Геометрия: пол (шахматная доска)
-// ---------------------------------------------------------------------------
-void buildFloor(std::vector<Vertex>& vertices, std::vector<uint16_t>& indices,
-                int tiles, float tileSize) {
     vertices.clear();
     indices.clear();
 
-    const float     half   = tiles * tileSize * 0.5f;
-    const glm::vec3 normal = glm::vec3(0.0f, 1.0f, 0.0f);
+    for (const Face& face : faces) {
+        glm::vec3 center(0.0f);
+        for (const glm::vec3& p : face.corners) center += p;
+        center /= static_cast<float>(face.corners.size());
 
-    for (int z = 0; z < tiles; ++z) {
-        for (int x = 0; x < tiles; ++x) {
-            const float     x0    = -half + x * tileSize;
-            const float     z0    = -half + z * tileSize;
-            const glm::vec3 color = glm::vec3((x + z) % 2 == 0 ? 0.6f : 0.3f);
-            const uint16_t  base  = static_cast<uint16_t>(vertices.size());
+        const float     radius = glm::length(face.corners[0] - center);
+        const glm::vec3 axisU  = glm::normalize(face.corners[0] - center);
+        const glm::vec3 axisV  = glm::cross(face.normal, axisU);
 
-            vertices.push_back({ { x0,            0.0f, z0            }, normal, color });
-            vertices.push_back({ { x0,            0.0f, z0 + tileSize }, normal, color });
-            vertices.push_back({ { x0 + tileSize, 0.0f, z0 + tileSize }, normal, color });
-            vertices.push_back({ { x0 + tileSize, 0.0f, z0            }, normal, color });
-
-            for (uint16_t i : { 0, 1, 2, 0, 2, 3 }) {
-                indices.push_back(base + i);
+        for (const auto& tri : face.triangles) {
+            for (const glm::vec3& p : tri) {
+                const glm::vec3 d  = p - center;
+                const glm::vec2 uv = glm::vec2(0.5f + 0.5f * glm::dot(d, axisU) / radius,
+                                               0.5f - 0.5f * glm::dot(d, axisV) / radius);
+                indices.push_back(static_cast<uint16_t>(vertices.size()));
+                vertices.push_back({ p, face.normal, uv });
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
+// Геометрия: плоскость (пол и стена)
+// ---------------------------------------------------------------------------
+void buildPlane(std::vector<Vertex>& vertices, std::vector<uint16_t>& indices,
+                float width, float depth, float uvPerUnit) {
+    const float     hw     = width * 0.5f;
+    const float     hd     = depth * 0.5f;
+    const glm::vec3 normal = glm::vec3(0.0f, 1.0f, 0.0f);
+
+    vertices = {
+        { { -hw, 0.0f, -hd }, normal, { 0.0f,               0.0f               } },
+        { { -hw, 0.0f,  hd }, normal, { 0.0f,               depth * uvPerUnit  } },
+        { {  hw, 0.0f,  hd }, normal, { width * uvPerUnit,  depth * uvPerUnit  } },
+        { {  hw, 0.0f, -hd }, normal, { width * uvPerUnit,  0.0f               } },
+    };
+    indices = { 0, 1, 2, 0, 2, 3 };
+}
+
+// ---------------------------------------------------------------------------
 // Шейдеры
 // ---------------------------------------------------------------------------
 std::vector<char> readShaderFile(const std::string& filename) {
-    static const char* searchDirs[] = { "", "../", "../../", "../../../" };
-
-    for (const char* dir : searchDirs) {
-        std::ifstream file(std::string(dir) + filename, std::ios::ate | std::ios::binary);
-        if (!file.is_open()) continue;
-
-        const size_t fileSize = static_cast<size_t>(file.tellg());
-        std::vector<char> buffer(fileSize);
-        file.seekg(0);
-        file.read(buffer.data(), fileSize);
-        return buffer;
+    const std::filesystem::path path = findDataPath(filename);
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if (path.empty() || !file.is_open()) {
+        std::cerr << "Failed to open shader file: " << filename
+                  << " (working directory: " << std::filesystem::current_path().string() << ")\n";
+        return {};
     }
 
-    std::cerr << "Failed to open shader file: " << filename
-              << " (working directory: " << std::filesystem::current_path().string() << ")\n";
-    return {};
+    const size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+    return buffer;
 }
 
 VkShaderModule createShaderModule(const std::vector<char>& code) {
@@ -363,11 +732,12 @@ VkShaderModule createShaderModule(const std::vector<char>& code) {
 // ---------------------------------------------------------------------------
 // Дескрипторы
 // ---------------------------------------------------------------------------
-void writeDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType type, const Buffer& buffer) {
+void writeBufferDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                           const Buffer& buffer, VkDeviceSize range = VK_WHOLE_SIZE) {
     const VkDescriptorBufferInfo info = {
         .buffer = buffer.buffer,
         .offset = 0,
-        .range  = VK_WHOLE_SIZE,
+        .range  = range,
     };
 
     const VkWriteDescriptorSet write = {
@@ -377,6 +747,25 @@ void writeDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType typ
         .descriptorCount = 1,
         .descriptorType  = type,
         .pBufferInfo     = &info,
+    };
+
+    vkUpdateDescriptorSets(device(), 1, &write, 0, nullptr);
+}
+
+void writeImageDescriptor(VkDescriptorSet set, uint32_t binding, VkImageView view) {
+    const VkDescriptorImageInfo info = {
+        .sampler     = sampler,
+        .imageView   = view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+
+    const VkWriteDescriptorSet write = {
+        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet          = set,
+        .dstBinding      = binding,
+        .descriptorCount = 1,
+        .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo      = &info,
     };
 
     vkUpdateDescriptorSets(device(), 1, &write, 0, nullptr);
@@ -404,11 +793,19 @@ bool createDescriptorSetLayouts() {
         },
     };
 
-    const VkDescriptorSetLayoutBinding modelBinding = {
-        .binding         = 0,
-        .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    const VkDescriptorSetLayoutBinding materialBindings[] = {
+        {
+            .binding         = 0,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        {
+            .binding         = 1,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
     };
 
     const VkDescriptorSetLayoutCreateInfo sceneInfo = {
@@ -417,27 +814,29 @@ bool createDescriptorSetLayouts() {
         .pBindings    = sceneBindings,
     };
 
-    const VkDescriptorSetLayoutCreateInfo modelInfo = {
+    const VkDescriptorSetLayoutCreateInfo materialInfo = {
         .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings    = &modelBinding,
+        .bindingCount = static_cast<uint32_t>(std::size(materialBindings)),
+        .pBindings    = materialBindings,
     };
 
     return vkCreateDescriptorSetLayout(device(), &sceneInfo, nullptr, &sceneSetLayout) == VK_SUCCESS &&
-           vkCreateDescriptorSetLayout(device(), &modelInfo, nullptr, &modelSetLayout) == VK_SUCCESS;
+           vkCreateDescriptorSetLayout(device(), &materialInfo, nullptr, &materialSetLayout) == VK_SUCCESS;
 }
 
 bool createDescriptorSets() {
-    const uint32_t objectCount = static_cast<uint32_t>(objects.size());
+    const uint32_t textureCount = static_cast<uint32_t>(textures.size());
 
     const VkDescriptorPoolSize poolSizes[] = {
-        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 + objectCount },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         1            },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         2            },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, textureCount },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, textureCount },
     };
 
     const VkDescriptorPoolCreateInfo poolInfo = {
         .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets       = 1 + objectCount,
+        .maxSets       = 1 + textureCount,
         .poolSizeCount = static_cast<uint32_t>(std::size(poolSizes)),
         .pPoolSizes    = poolSizes,
     };
@@ -457,17 +856,19 @@ bool createDescriptorSets() {
         return false;
     }
 
-    writeDescriptor(sceneSet, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sceneUniformBuffer);
-    writeDescriptor(sceneSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pointLightBuffer);
-    writeDescriptor(sceneSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spotLightBuffer);
+    writeBufferDescriptor(sceneSet, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sceneUniformBuffer);
+    writeBufferDescriptor(sceneSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pointLightBuffer);
+    writeBufferDescriptor(sceneSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spotLightBuffer);
 
-    allocInfo.pSetLayouts = &modelSetLayout;
+    allocInfo.pSetLayouts = &materialSetLayout;
 
-    for (SceneObject& obj : objects) {
-        if (vkAllocateDescriptorSets(device(), &allocInfo, &obj.descriptorSet) != VK_SUCCESS) {
+    for (Texture& texture : textures) {
+        if (vkAllocateDescriptorSets(device(), &allocInfo, &texture.descriptorSet) != VK_SUCCESS) {
             return false;
         }
-        writeDescriptor(obj.descriptorSet, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, obj.uniforms);
+        writeBufferDescriptor(texture.descriptorSet, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                              modelUniformBuffer, sizeof(ModelUniforms));
+        writeImageDescriptor(texture.descriptorSet, 1, texture.view);
     }
 
     return true;
@@ -477,12 +878,20 @@ bool createDescriptorSets() {
 // Графический конвейер
 // ---------------------------------------------------------------------------
 bool createPipeline() {
-    const VkDescriptorSetLayout setLayouts[] = { sceneSetLayout, modelSetLayout };
+    const VkDescriptorSetLayout setLayouts[] = { sceneSetLayout, materialSetLayout };
+
+    const VkPushConstantRange pushRange = {
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset     = 0,
+        .size       = sizeof(SamplingPushConstants),
+    };
 
     const VkPipelineLayoutCreateInfo layoutInfo = {
-        .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = static_cast<uint32_t>(std::size(setLayouts)),
-        .pSetLayouts    = setLayouts,
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount         = static_cast<uint32_t>(std::size(setLayouts)),
+        .pSetLayouts            = setLayouts,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &pushRange,
     };
 
     if (vkCreatePipelineLayout(device(), &layoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
@@ -523,7 +932,7 @@ bool createPipeline() {
     const VkVertexInputAttributeDescription attribDesc[] = {
         { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, pos)    },
         { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, normal) },
-        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, color)  },
+        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT,    .offset = offsetof(Vertex, uv)     },
     };
 
     const VkPipelineVertexInputStateCreateInfo vertexInput = {
@@ -620,28 +1029,44 @@ bool createPipeline() {
 // Сцена по умолчанию
 // ---------------------------------------------------------------------------
 void createDefaultScene() {
-    SceneObject dodecahedron;
-    dodecahedron.name = "Dodecahedron";
-    dodecahedron.mesh = &dodecahedronMesh;
-    dodecahedron.material = {
-        .albedo         = glm::vec3(1.0f, 0.7f, 0.2f),
-        .vertexColorMix = 0.5f,
-        .specular       = glm::vec3(1.0f),
-        .shininess      = 64.0f,
-    };
+    const float smallScale = 0.8f;
+    const float smallY     = floorHeight + dodecahedronBottom * smallScale;
+
+    SceneObject lava;
+    lava.name = "Dodecahedron (lava)";
+    lava.mesh = &dodecahedronMesh;
+    lava.material = { .texture = findTexture("lava"), .specular = glm::vec3(0.6f), .shininess = 64.0f };
+    lava.animatedSampling = true;
+
+    SceneObject marble;
+    marble.name = "Dodecahedron (marble)";
+    marble.mesh = &dodecahedronMesh;
+    marble.position = glm::vec3(-4.5f, smallY, -3.0f);
+    marble.scale = glm::vec3(smallScale);
+    marble.material = { .texture = findTexture("marble"), .specular = glm::vec3(1.0f), .shininess = 128.0f };
+
+    SceneObject metal;
+    metal.name = "Dodecahedron (metal)";
+    metal.mesh = &dodecahedronMesh;
+    metal.position = glm::vec3(4.5f, smallY, -3.0f);
+    metal.rotation = glm::vec3(0.0f, 30.0f, 0.0f);
+    metal.scale = glm::vec3(smallScale);
+    metal.material = { .texture = findTexture("metal"), .specular = glm::vec3(1.0f), .shininess = 96.0f };
 
     SceneObject floor;
     floor.name = "Floor";
     floor.mesh = &floorMesh;
     floor.position = glm::vec3(0.0f, floorHeight, 0.0f);
-    floor.material = {
-        .albedo         = glm::vec3(1.0f),
-        .vertexColorMix = 1.0f,
-        .specular       = glm::vec3(0.3f),
-        .shininess      = 16.0f,
-    };
+    floor.material = { .texture = findTexture("stone_tiles"), .specular = glm::vec3(0.2f), .shininess = 16.0f };
 
-    objects = { dodecahedron, floor };
+    SceneObject wall;
+    wall.name = "Wall";
+    wall.mesh = &wallMesh;
+    wall.position = glm::vec3(0.0f, floorHeight + 4.0f, -10.0f);
+    wall.rotation = glm::vec3(90.0f, 0.0f, 0.0f);
+    wall.material = { .texture = findTexture("bricks"), .specular = glm::vec3(0.1f), .shininess = 8.0f };
+
+    objects = { lava, marble, metal, floor, wall };
 
     pointLights = {
         { .position = { -3.0f, 0.5f,  2.0f }, .color = { 1.0f, 0.3f, 0.2f }, .intensity = 8.0f },
@@ -658,7 +1083,7 @@ void createDefaultScene() {
 // Интерфейс
 // ---------------------------------------------------------------------------
 void drawCameraUI() {
-    if (!ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) return;
+    if (!ImGui::CollapsingHeader("Camera")) return;
 
     if (ImGui::RadioButton("Perspective", camera.perspective)) camera.perspective = true;
     ImGui::SameLine();
@@ -675,11 +1100,11 @@ void drawCameraUI() {
     }
 
     ImGui::SliderFloat("Move speed", &camera.moveSpeed, 0.5f, 20.0f);
-    ImGui::TextDisabled("WASD/QE - move, RMB - look, wheel - FOV");
+    ImGui::TextDisabled("WASD/QE - move, RMB - look, wheel - zoom");
 }
 
 void drawLightsUI() {
-    if (ImGui::CollapsingHeader("Ambient & Directional", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Ambient & Directional")) {
         ImGui::ColorEdit3("Ambient color", &ambientColor.x);
         ImGui::SliderFloat("Ambient intensity", &ambientIntensity, 0.0f, 1.0f);
         ImGui::Separator();
@@ -688,7 +1113,7 @@ void drawLightsUI() {
         ImGui::SliderFloat("Intensity##dir", &dirLight.intensity, 0.0f, 3.0f);
     }
 
-    if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Point lights")) {
         ImGui::Checkbox("Orbit point lights", &animateLights);
         if (ImGui::Button("Add point light")) {
             pointLights.push_back({});
@@ -710,7 +1135,7 @@ void drawLightsUI() {
         if (toRemove >= 0) pointLights.erase(pointLights.begin() + toRemove);
     }
 
-    if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Spot lights")) {
         if (ImGui::Button("Add spot light")) {
             spotLights.push_back({});
         }
@@ -750,8 +1175,17 @@ void drawObjectsUI() {
             ImGui::SliderFloat3("Rotation", &obj.rotation.x, -180.0f, 180.0f);
             ImGui::SliderFloat3("Scale", &obj.scale.x, 0.1f, 5.0f);
             ImGui::Separator();
-            ImGui::ColorEdit3("Albedo", &obj.material.albedo.x);
-            ImGui::SliderFloat("Vertex color mix", &obj.material.vertexColorMix, 0.0f, 1.0f);
+
+            if (ImGui::BeginCombo("Texture", textures[obj.material.texture].name.c_str())) {
+                for (int t = 0; t < static_cast<int>(textures.size()); ++t) {
+                    const bool selected = t == obj.material.texture;
+                    if (ImGui::Selectable(textures[t].name.c_str(), selected)) obj.material.texture = t;
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::Checkbox("Animated sampling", &obj.animatedSampling);
             ImGui::ColorEdit3("Specular color", &obj.material.specular.x);
             ImGui::SliderFloat("Shininess", &obj.material.shininess, 1.0f, 256.0f, "%.1f",
                                ImGuiSliderFlags_Logarithmic);
@@ -760,10 +1194,23 @@ void drawObjectsUI() {
         ImGui::PopID();
     }
 
-    ImGui::SeparatorText("Dodecahedron animation");
+    ImGui::SeparatorText("Lava dodecahedron animation");
     ImGui::Checkbox("Play animation", &isAnimated);
-    ImGui::SliderFloat("Speed", &animationSpeed, 0.0f, 5.0f);
+    ImGui::SliderFloat("Speed##anim", &animationSpeed, 0.0f, 5.0f);
     ImGui::SliderFloat("Orbit radius", &pathRadius, 0.5f, 5.0f);
+}
+
+void drawSamplingUI() {
+    if (!ImGui::CollapsingHeader("Animated sampling", ImGuiTreeNodeFlags_DefaultOpen)) return;
+
+    ImGui::SliderFloat("Speed##fx", &effectSpeed, 0.0f, 5.0f);
+    ImGui::SliderFloat("Distortion", &effectDistortion, 0.0f, 0.15f);
+    ImGui::SliderFloat("Layer scale", &effectLayerScale, 0.25f, 4.0f);
+    ImGui::Checkbox("Color modulation", &colorModulation);
+    if (colorModulation) {
+        ImGui::ColorEdit3("Tint A", &tintA.x);
+        ImGui::ColorEdit3("Tint B", &tintB.x);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +1227,11 @@ void updateCameraInput(float dt) {
             if (camera.yaw > 180.0f)  camera.yaw -= 360.0f;
             if (camera.yaw < -180.0f) camera.yaw += 360.0f;
         }
-        camera.fov = std::clamp(camera.fov - io.MouseWheel * 2.0f, 20.0f, 120.0f);
+        if (camera.perspective) {
+            camera.fov = std::clamp(camera.fov - io.MouseWheel * 2.0f, 20.0f, 120.0f);
+        } else {
+            camera.orthoSize = std::clamp(camera.orthoSize - io.MouseWheel * 0.5f, 1.0f, 20.0f);
+        }
     }
 
     if (io.WantCaptureKeyboard) return;
@@ -823,7 +1274,7 @@ void uploadSceneData(float aspect) {
         proj = glm::perspective(glm::radians(camera.fov), aspect, 0.05f, 200.0f);
     } else {
         const float s = camera.orthoSize;
-        proj = glm::ortho(-s * aspect, s * aspect, -s, s, 0.05f, 200.0f);
+        proj = glm::ortho(-s * aspect, s * aspect, -s, s, -100.0f, 100.0f);
     }
     proj[1][1] *= -1.0f;
 
@@ -858,55 +1309,69 @@ void uploadSceneData(float aspect) {
     const VkDeviceSize spotSize  = sizeof(GpuSpotLight) * gpuSpots.size();
 
     if (ensureCapacity(pointLightBuffer, pointSize)) {
-        writeDescriptor(sceneSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pointLightBuffer);
+        writeBufferDescriptor(sceneSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pointLightBuffer);
     }
     if (ensureCapacity(spotLightBuffer, spotSize)) {
-        writeDescriptor(sceneSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spotLightBuffer);
+        writeBufferDescriptor(sceneSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spotLightBuffer);
     }
 
     uploadBuffer(pointLightBuffer, gpuPoints.data(), pointSize);
     uploadBuffer(spotLightBuffer, gpuSpots.data(), spotSize);
 }
 
-void uploadObjectData(SceneObject& obj) {
-    const glm::mat4 model = buildModelMatrix(obj);
+void uploadModelData() {
+    auto* base = static_cast<uint8_t*>(modelUniformBuffer.mapped);
 
-    const ModelUniforms data = {
-        .model        = model,
-        .normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(model)))),
-        .albedo       = glm::vec4(obj.material.albedo, obj.material.vertexColorMix),
-        .specular     = glm::vec4(obj.material.specular, obj.material.shininess),
-    };
-    uploadBuffer(obj.uniforms, &data, sizeof(data));
+    for (size_t i = 0; i < objects.size(); ++i) {
+        const SceneObject& obj   = objects[i];
+        const glm::mat4    model = buildModelMatrix(obj);
+
+        const ModelUniforms data = {
+            .model        = model,
+            .normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(model)))),
+            .specular     = glm::vec4(obj.material.specular, obj.material.shininess),
+        };
+        std::memcpy(base + i * modelUniformStride, &data, sizeof(data));
+    }
+
+    vmaFlushAllocation(allocator(), modelUniformBuffer.allocation, 0, VK_WHOLE_SIZE);
 }
 
-} // namespace
+// ---------------------------------------------------------------------------
+// Создание ресурсов
+// ---------------------------------------------------------------------------
+bool createResources() {
+    if (!createUploadPool() || !createSampler()) {
+        std::cerr << "Failed to create upload command pool or sampler\n";
+        return false;
+    }
 
-// ---------------------------------------------------------------------------
-// Инициализация
-// ---------------------------------------------------------------------------
-static bool createResources() {
+    if (!loadTextures()) return false;
+
     std::vector<Vertex>   vertices;
     std::vector<uint16_t> indices;
 
     buildDodecahedron(vertices, indices);
     if (!createMesh(vertices, indices, dodecahedronMesh)) return false;
 
-    buildFloor(vertices, indices, 20, 1.0f);
+    buildPlane(vertices, indices, 20.0f, 20.0f, 0.25f);
     if (!createMesh(vertices, indices, floorMesh)) return false;
+
+    buildPlane(vertices, indices, 20.0f, 8.0f, 0.25f);
+    if (!createMesh(vertices, indices, wallMesh)) return false;
 
     createDefaultScene();
 
-    if (!createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, sceneUniformBuffer) ||
-        !createBuffer(sizeof(GpuPointLight) * initialLightCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, pointLightBuffer) ||
-        !createBuffer(sizeof(GpuSpotLight) * initialLightCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spotLightBuffer)) {
-        return false;
-    }
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(graphics::internal::context.physical_device, &props);
+    const VkDeviceSize align = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 1);
+    modelUniformStride = (sizeof(ModelUniforms) + align - 1) / align * align;
 
-    for (SceneObject& obj : objects) {
-        if (!createBuffer(sizeof(ModelUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, obj.uniforms)) {
-            return false;
-        }
+    if (!createHostBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, sceneUniformBuffer) ||
+        !createHostBuffer(modelUniformStride * objects.size(), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, modelUniformBuffer) ||
+        !createHostBuffer(sizeof(GpuPointLight) * initialLightCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, pointLightBuffer) ||
+        !createHostBuffer(sizeof(GpuSpotLight) * initialLightCapacity, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, spotLightBuffer)) {
+        return false;
     }
 
     if (!createDescriptorSetLayouts()) {
@@ -922,6 +1387,8 @@ static bool createResources() {
     return createPipeline();
 }
 
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Завершение
 // ---------------------------------------------------------------------------
@@ -931,28 +1398,38 @@ void shutdown() {
     vkDestroyPipeline(device(), pipeline, nullptr);
     vkDestroyPipelineLayout(device(), pipelineLayout, nullptr);
     vkDestroyDescriptorPool(device(), descriptorPool, nullptr);
-    vkDestroyDescriptorSetLayout(device(), modelSetLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device(), materialSetLayout, nullptr);
     vkDestroyDescriptorSetLayout(device(), sceneSetLayout, nullptr);
+    vkDestroySampler(device(), sampler, nullptr);
+    vkDestroyCommandPool(device(), uploadPool, nullptr);
 
-    pipeline       = VK_NULL_HANDLE;
-    pipelineLayout = VK_NULL_HANDLE;
-    descriptorPool = VK_NULL_HANDLE;
-    modelSetLayout = VK_NULL_HANDLE;
-    sceneSetLayout = VK_NULL_HANDLE;
+    pipeline          = VK_NULL_HANDLE;
+    pipelineLayout    = VK_NULL_HANDLE;
+    descriptorPool    = VK_NULL_HANDLE;
+    materialSetLayout = VK_NULL_HANDLE;
+    sceneSetLayout    = VK_NULL_HANDLE;
+    sampler           = VK_NULL_HANDLE;
+    uploadPool        = VK_NULL_HANDLE;
 
-    for (SceneObject& obj : objects) {
-        destroyBuffer(obj.uniforms);
+    for (Texture& texture : textures) {
+        destroyTexture(texture);
     }
+    textures.clear();
     objects.clear();
 
     destroyBuffer(sceneUniformBuffer);
+    destroyBuffer(modelUniformBuffer);
     destroyBuffer(pointLightBuffer);
     destroyBuffer(spotLightBuffer);
 
     destroyMesh(dodecahedronMesh);
     destroyMesh(floorMesh);
+    destroyMesh(wallMesh);
 }
 
+// ---------------------------------------------------------------------------
+// Инициализация
+// ---------------------------------------------------------------------------
 bool initialize() {
     if (createResources()) return true;
 
@@ -970,13 +1447,16 @@ void update(double time) {
 
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(360, 680), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Lab 2: Camera & Lighting");
+    ImGui::Begin("Lab 3: Texture mapping");
     drawCameraUI();
     drawLightsUI();
     drawObjectsUI();
+    drawSamplingUI();
     ImGui::End();
 
     updateCameraInput(dt);
+
+    effectTime += dt * effectSpeed;
 
     if (isAnimated && !objects.empty()) {
         SceneObject& shape = objects[0];
@@ -1026,19 +1506,36 @@ void render(const graphics::internal::FrameData& fd) {
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     uploadSceneData(viewport.width / viewport.height);
-    for (SceneObject& obj : objects) {
-        uploadObjectData(obj);
-    }
+    uploadModelData();
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
                             0, 1, &sceneSet, 0, nullptr);
 
-    for (const SceneObject& obj : objects) {
-        const VkDeviceSize offset = 0;
+    for (size_t i = 0; i < objects.size(); ++i) {
+        const SceneObject& obj     = objects[i];
+        const Texture&     texture = textures[obj.material.texture];
+        const uint32_t     offset  = static_cast<uint32_t>(i * modelUniformStride);
+
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                1, 1, &obj.descriptorSet, 0, nullptr);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &obj.mesh->vertices.buffer, &offset);
+                                1, 1, &texture.descriptorSet, 1, &offset);
+
+        uint32_t flags = 0;
+        if (obj.animatedSampling) flags |= FLAG_ANIMATED_SAMPLING;
+        if (colorModulation)      flags |= FLAG_COLOR_MODULATION;
+
+        const SamplingPushConstants push = {
+            .tintA      = glm::vec4(tintA, 1.0f),
+            .tintB      = glm::vec4(tintB, 1.0f),
+            .time       = effectTime,
+            .distortion = effectDistortion,
+            .layerScale = effectLayerScale,
+            .flags      = flags,
+        };
+        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+
+        const VkDeviceSize vertexOffset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &obj.mesh->vertices.buffer, &vertexOffset);
         vkCmdBindIndexBuffer(cmd, obj.mesh->indices.buffer, 0, VK_INDEX_TYPE_UINT16);
         vkCmdDrawIndexed(cmd, obj.mesh->indexCount, 1, 0, 0, 0);
     }
